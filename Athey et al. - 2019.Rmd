@@ -1,0 +1,351 @@
+---
+title: "The Surrogate Index: Combining Short-Term Proxies to Estimate Long-Term Treatment Effects More Rapidly and Precisely"
+output: html_notebook
+---
+
+```{r}
+# Import modules
+suppressMessages(library(haven))
+suppressMessages(library(dplyr))
+suppressMessages(library(ggplot2))
+suppressMessages(library(MatchIt))
+```
+
+```{r}
+# Import raw data
+raw_data = read_dta("https://github.com/OpportunityInsights/Surrogates-Replication-Code/raw/master/Data-raw/simulated%20All%20Locations%20GAIN%20data.dta")
+head(raw_data)
+```
+
+```{r}
+
+# Create df frame from raw data
+df <- data.frame(raw_data, sep = "")
+
+# Calculate cumulative mean for 'emp' variables from 1 to 36
+df$cum_emp_1 <- df$emp1
+for (i in 2:36) {
+  df[[paste("cum_emp_", i, sep="")]] <- df[[paste("emp", i, sep="")]] + df[[paste("cum_emp_", i - 1, sep="")]]
+}
+
+# Divide cumulative sum by iteration index to get the cumulative mean
+for (i in 1:36) {
+  df[[paste("cum_emp_", i, sep="")]] <- df[[paste("cum_emp_", i, sep="")]] / i
+}
+
+# Subset the data and calculate average employment rates
+treatment_avg <- colMeans(df[df$treatment == 1, paste0("emp", 1:36)]) * 100
+control_avg <- colMeans(df[df$treatment == 0, paste0("emp", 1:36)]) * 100
+```
+
+```{r}
+# Create a data frame for plotting
+plot_data <- data.frame(
+  Quarter = rep(1:36, 2),
+  EmploymentRate = c(treatment_avg, control_avg),
+  Group = rep(c("Treatment", "Control"), each = 36)
+)
+
+# Plot the employment rate for treatment and control groups over 36 quarters
+ggplot(plot_data, aes(x = Quarter, y = EmploymentRate, color = Group, shape = Group)) +
+  geom_point(size = 3, alpha = 1) +
+  geom_line(linewidth = 1, alpha = 1) +
+  geom_hline(yintercept = mean(treatment_avg), color = "#1f78b4", linetype = "dashed", linewidth = 1) +
+  geom_hline(yintercept = mean(control_avg), color = "#b2df8a", linetype = "dashed", linewidth = 1) +
+  labs(
+    x = "Quarters Since Random Assignment",
+    y = "Employment Rate (%)",
+    title = "Employment Rate Over Quarters for\n Treatment and Control Groups"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.line = element_line(color = "black"),
+  ) +
+  scale_x_continuous(breaks = seq(1, 36, by = 5), limits = c(1, 36)) +
+  scale_y_continuous(breaks = seq(10, 40, by = 5), limits = c(10, 40)) +
+  scale_color_manual(values = c("#1f78b4", "#b2df8a")) +
+  scale_shape_manual(values = c(16, 17))
+
+```
+
+```{r}
+
+# Function to estimate treatment effects using different methods
+estimation_function <- function(
+    data_E, data_O, primary_outcome,
+    surrogates, covariates = NULL, treatment) {
+
+  ### Estimate ρ(X_i)
+  if (!is.null(covariates)) {
+    # Fit W_i ~ X_i in the experimental group
+    formula_rho_X <- as.formula(
+      paste0(treatment, " ~ ", paste(covariates, collapse = " + ")))
+    model_rho_X <- glm(formula_rho_X, data = data_E, family = binomial)
+    data_E$rho_X <- predict(
+      model_rho_X, newdata = data_E, type = "response")
+    data_O$rho_X <- predict(
+      model_rho_X, newdata = data_O, type = "response")
+    # Fit model for W_i ~ S_i + X_i in the experimental group
+    predictors_rho_SX <- c(surrogates, covariates)
+  } else {
+    # If no covariates, ρ(X_i) is the treatment group proportion
+    data_E$rho_X <- mean(data_E[[treatment]])
+    data_O$rho_X <- mean(data_E[[treatment]])
+    predictors_rho_SX <- surrogates
+  }
+
+  # Fit Y_i ~ S_i + X_i in the observational group
+  formula_mu <- as.formula(paste0(primary_outcome, " ~ ", paste0(predictors_rho_SX, collapse = " + ")))
+  model_mu_O <- lm(formula_mu, data = data_O)
+
+  # Predict μ_hat
+  data_E$mu_hat <- predict(model_mu_O, newdata = data_E)
+  data_O$mu_hat <- predict(model_mu_O, newdata = data_O)
+
+  ### Calculate Surrogate Index Estimator
+  data_E$weight_treated <- data_E[[treatment]] / data_E$rho_X
+  data_E$weight_control <- (1 - data_E[[treatment]]) / (1 - data_E$rho_X)
+
+  numerator_treated <- sum(
+    data_E$mu_hat * data_E$weight_treated, na.rm = TRUE)
+  numerator_control <- sum(
+    data_E$mu_hat * data_E$weight_control, na.rm = TRUE)
+
+  denominator_treated <- sum(data_E$weight_treated, na.rm = TRUE)
+  denominator_control <- sum(data_E$weight_control, na.rm = TRUE)
+
+  tau_E <- ((numerator_treated / denominator_treated)
+            - (numerator_control / denominator_control))
+
+  ### Estimate ρ(S_i, X_i)
+  # Fit W_i ~ S_i + X_i in the experimental group
+  formula_rho_SX <- as.formula(
+    paste0(treatment, " ~ ", paste(predictors_rho_SX, collapse = " + ")))
+  model_rho_SX <- glm(formula_rho_SX, data = data_E, family = binomial)
+  data_E$rho_SX <- predict(
+    model_rho_SX, newdata = data_E, type = "response")
+  data_O$rho_SX <- predict(
+    model_rho_SX, newdata = data_O, type = "response")
+
+  ### Merge data to estimate φ(S_i, X_i)
+  common_cols <- unique(c(surrogates, covariates))
+  data_E_subset <- data_E[, common_cols, drop = FALSE]
+  data_O_subset <- data_O[, common_cols, drop = FALSE]
+
+  # Add P_binary, experimental group as 1, observational group as 0
+  data_E_subset$P_binary <- 1
+  data_O_subset$P_binary <- 0
+
+  data_combined <- rbind(data_E_subset, data_O_subset)
+
+  ### Estimate φ(S_i, X_i)
+  # Fit P_binary ~ S_i + X_i
+  formula_phi_SX <- as.formula(
+    paste("P_binary ~", paste(predictors_rho_SX, collapse = " + ")))
+  model_phi_SX <- glm(
+    formula_phi_SX, data = data_combined, family = binomial)
+
+  # Predict φ_SX
+  data_O$phi_SX <- predict(
+    model_phi_SX, newdata = data_O, type = "response")
+
+  # φ is the proportion of the experimental group
+  phi <- nrow(data_E) / (nrow(data_E) + nrow(data_O))
+
+  ### Calculate Surrogate Score Estimator
+  data_O$phi <- phi
+  data_O$one_minus_phi_SX <- 1 - data_O$phi_SX
+  data_O$one_minus_phi <- 1 - phi
+
+  # Calculate ω_1 and ω_0
+  data_O$omega_1 <- with(data_O,
+                         (rho_SX * phi_SX * one_minus_phi) /
+                           (rho_X * one_minus_phi_SX * phi))
+  data_O$omega_0 <- with(data_O,
+                         ((1 - rho_SX) * phi_SX * one_minus_phi) /
+                           ((1 - rho_X) * one_minus_phi_SX * phi))
+
+  # Calculate weighted Y
+  sum_weighted_Y_1 <- sum(
+    data_O[[primary_outcome]] * data_O$omega_1, na.rm = TRUE)
+  sum_weighted_Y_0 <- sum(
+    data_O[[primary_outcome]] * data_O$omega_0, na.rm = TRUE)
+  sum_omega_1 <- sum(data_O$omega_1, na.rm = TRUE)
+  sum_omega_0 <- sum(data_O$omega_0, na.rm = TRUE)
+
+  tau_O <- ((sum_weighted_Y_1 / sum_omega_1)
+            - (sum_weighted_Y_0 / sum_omega_0))
+
+  ### Calculate Influence Function Estimator
+
+  # For the experimental group
+  data_E$IF_E <- (phi / data_E$rho_X) * (
+    (data_E[[treatment]] * (data_E$mu_hat - tau_E)) / data_E$rho_X -
+      ((1 - data_E[[treatment]]) * (data_E$mu_hat - tau_E)) / (1 - data_E$rho_X)
+  )
+
+  # For the observational group
+  data_O$IF_O <- ((1 - phi) / (data_O$rho_X * (1 - data_O$rho_X))) * (
+    data_O$phi_SX * (data_O[[primary_outcome]] - data_O$mu_hat) * (data_O$rho_SX - data_O$rho_X)
+  )
+  # Calculate Influence Function Estimator
+  tau_EO <- (mean(data_E$IF_E, na.rm = TRUE)
+             + mean(data_O$IF_O, na.rm = TRUE) + tau_E)
+
+  ### Calculate Double Matching Estimator
+  if (!is.null(covariates)) {
+    # First matching: match treated and control groups in experimental data based on covariates
+    formula1 <- as.formula(paste(treatment, " ~ ", paste(covariates, collapse = " + ")))
+    matchit_res1 <- matchit(formula1, data = data_E, method = "nearest")
+    matched1 <- match.data(matchit_res1)
+
+    # Second matching: find the closest observational pairs for each experimental pair based on covariates and surrogates
+    match_vars <- c(covariates, surrogates)
+    treatment_effects <- numeric(nrow(matched1) / 2)
+
+    # Iterate over each matched pair
+    for (i in seq(1, nrow(matched1), by = 2)) {
+      treated <- matched1[i, ]
+      control <- matched1[i + 1, ]
+
+      # Calculate distances to all observational units and find the closest unit
+      treated_distances <- rowSums(sapply(match_vars, function(var) (data_O[[var]] - treated[[var]])^2))
+      control_distances <- rowSums(sapply(match_vars, function(var) (data_O[[var]] - control[[var]])^2))
+
+      closest_treated <- data_O[which.min(treated_distances), ]
+      closest_control <- data_O[which.min(control_distances), ]
+
+      # Calculate treatment effect
+      if (!is.na(closest_treated[[primary_outcome]]) && !is.na(closest_control[[primary_outcome]])) {
+        treatment_effects[i] <- (treated[[primary_outcome]] - control[[primary_outcome]] +
+                                   closest_treated[[primary_outcome]] - closest_control[[primary_outcome]]) / 2
+      }
+    }
+    # Calculate average treatment effect
+    tau_match <- mean(treatment_effects, na.rm = TRUE)
+  } else {
+    tau_match <- "Cannot calculate double matching estimator without covariates!"
+  }
+
+  ### Return results
+  results <- list(
+    Surrogate_Index_Estimator = tau_E,
+    Surrogate_Score_Estimator = tau_O,
+    Influence_Function_Estimator = tau_EO,
+    Double_Matching_Estimator = tau_match
+  )
+
+  return(results)
+}
+
+```
+
+```{r}
+# Create lists to store results for each method
+naive_reg_list <- list()
+surrogate_index_list <- list()
+surrogate_score_list <- list()
+influence_function_list <- list()
+double_matching_list <- list()
+
+# Split data into experimental and observational groups
+data_E = subset(df, site == "Riverside")
+data_O = subset(df, site != "Riverside")
+
+# Define primary outcome and treatment variables
+primary_outcome = "cum_emp_36"
+treatment = "treatment"
+
+# Create "ground truth": experimental estimate of treatment effect on cumulative mean
+exp_reg <- lm(paste0(primary_outcome, " ~ ", treatment), data = data_E)
+
+# Use cumulative employment from emp1 to emp36 as surrogate variables
+for (i in 1:36) {
+  surrogate_vars <- paste0("emp", 1:i)
+  results <- estimation_function(
+    data_E = data_E,
+    data_O = data_O,
+    primary_outcome = primary_outcome,
+    surrogates = surrogate_vars,
+    covariates = NULL,
+    treatment = treatment
+  )
+  
+  # Store results for different estimators
+  surrogate_index_list[[i]] <- results$Surrogate_Index_Estimator
+  surrogate_score_list[[i]] <- results$Surrogate_Score_Estimator
+  influence_function_list[[i]] <- results$Influence_Function_Estimator
+  double_matching_list[[i]] <- results$Double_Matching_Estimator
+  
+  # Create naive estimate: treatment effect on cumulative mean
+  naive_reg_list[[i]] <- lm(paste0("cum_emp_", i, " ~ ", treatment), data = data_E)
+}
+```
+
+```{r}
+# Plotting section
+par(mar = c(5, 5, 4, 2))  # Set plot margins
+
+# Create empty plot
+plot(1, type = "n", axes = FALSE, 
+     xlab = "Quarters Since Random Assignment", 
+     ylab = "Estimated Treatment Effect on Mean \nEmployment Rate Over Nine Years (%)",
+     main = "Varying Quarters to Construct Estimates with Covariates", 
+     xlim = c(0, 36), ylim = c(0, 14))
+
+# Add grid lines
+grid(nx = 10, ny = 10, lty = 1, col = "gray90")
+
+# Add axes
+axis(side = 1, at = seq(1, 36, by = 5), labels = TRUE)
+axis(side = 2, at = seq(0, 14, by = 2), labels = TRUE)
+
+# Add central solid line for experimental estimate of treatment effect
+exp_treatment_coeff <- as.numeric(exp_reg$coefficients[2] * 100)
+abline(h = exp_treatment_coeff, col = "black", lwd = 2.5)
+
+# Add dashed lines for confidence intervals of experimental estimate
+conf_interval <- as.numeric(confint(exp_reg)[2, 1:2] * 100)
+for (i in conf_interval) {
+  abline(h = i, col = "black", lty = 2, lwd = 1.5)
+}
+
+# Plot estimates for Naive, Surrogate Index, Surrogate Score, Influence Function, and Double Matching
+for (i in 1:36) {
+  naive_coeff <- as.numeric(naive_reg_list[[i]]$coefficients[2] * 100)
+  sind_coeff <- as.numeric(surrogate_index_list[[i]] * 100)
+  score_coeff <- as.numeric(surrogate_score_list[[i]] * 100)
+  influence_coeff <- as.numeric(influence_function_list[[i]] * 100)
+  matching_coeff <- ifelse(is.numeric(double_matching_list[[i]]), as.numeric(double_matching_list[[i]] * 100), NA)
+  
+  # Naive estimates (using red open squares)
+  points(i, naive_coeff, pch = 22, col = "red", bg = "white")
+  
+  # Surrogacy Index estimates (using blue open circles)
+  points(i, sind_coeff, pch = 21, col = "blue", bg = "white")
+  
+  # Surrogate Score estimates (using green open triangles)
+  points(i, score_coeff, pch = 24, col = "green", bg = "white")
+  
+  # Influence Function estimates (using purple open diamonds)
+  points(i, influence_coeff, pch = 23, col = "purple", bg = "white")
+  
+  # Double Matching estimates (using orange open hexagons)
+  if (!is.na(matching_coeff)) {
+    points(i, matching_coeff, pch = 25, col = "orange", bg = "white")
+  }
+}
+
+# Add legend with smaller size and transparent background
+legend("topright",
+       col = c("red", "blue", "green", "purple", "orange", "black"),
+       text.col = "black", 
+       legend = c("Naive", "Surrogacy Index", "Surrogate Score",
+                  "Influence Function", "Double Matching", "Long-term ATE"),
+       pch = c(22, 21, 24, 23, 25, NA), lty = c(NA, NA, NA, NA, NA, 1),
+       lwd = c(1, 1, 1, 1, 1, 2), 
+       cex = 0.6,
+       bty = "n")
+```
